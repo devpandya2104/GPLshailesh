@@ -73,6 +73,12 @@ function getPropText(prop) {
     case 'number':    return String(prop.number ?? '');
     case 'email':     return prop.email || '';
     case 'phone_number': return prop.phone_number || '';
+    case 'files':
+      return (prop.files || []).map(f => f.external?.url || f.file?.url || '').filter(Boolean).join(' ');
+    case 'rollup':
+      if (prop.rollup?.type === 'array')  return (prop.rollup.array || []).map(getPropText).join(' ');
+      if (prop.rollup?.type === 'number') return String(prop.rollup.number ?? '');
+      return '';
     default: return '';
   }
 }
@@ -161,11 +167,12 @@ function pageEntryFromNotion(page, config) {
     finalDocValue = getPropText(finalDocProp);
   }
 
-  // Fallback: search ALL properties for a Google Doc URL
+  // Fallback: search ALL properties for a Google Doc/Drive URL in ANY format
+  // (docs.google.com/document, drive.google.com, google.com/open?id=)
   if (!finalDocValue || !extractDocFileId(finalDocValue)) {
     for (const [propName, propVal] of Object.entries(props)) {
       const val = getPropText(propVal);
-      if (val && val.includes('docs.google.com/document') && extractDocFileId(val)) {
+      if (val && /(?:docs|drive)\.google\.com|google\.com\/open/i.test(val) && extractDocFileId(val)) {
         finalDocValue = val;
         console.log(`[GPL bg] Found doc URL in prop "${propName}": ${val.slice(0,60)}`);
         break;
@@ -362,10 +369,20 @@ async function notionDirectSearch(docUrl, docFileId, config) {
   if (!docFileId) return null;
   const headers = notionHeaders(config.apiKey);
 
+  // Resolve the real property name from the DB schema — tolerates case or
+  // whitespace differences between the configured name and the actual column.
+  if (!Object.keys(_schemaTypes).length) await ensureSchema(config);
+  let propName = config.propFinalDoc;
+  if (Object.keys(_schemaTypes).length && _schemaTypes[propName] === undefined) {
+    const want = (propName || '').toLowerCase().trim();
+    const ci = Object.keys(_schemaTypes).find(n => n.toLowerCase().trim() === want);
+    if (ci) { propName = ci; console.log(`[GPL bg] Final Doc prop resolved to "${ci}"`); }
+  }
+
   const filters = [
-    { property: config.propFinalDoc, rich_text:{ contains: docFileId } },
-    { property: config.propFinalDoc, url:{ contains: docFileId } },
-    { property: config.propFinalDoc, formula:{ string:{ contains: docFileId } } },
+    { property: propName, rich_text:{ contains: docFileId } },
+    { property: propName, url:{ contains: docFileId } },
+    { property: propName, formula:{ string:{ contains: docFileId } } },
   ];
 
   const searchResults = await Promise.allSettled(
@@ -455,13 +472,40 @@ async function notionFetchCard(docUrl, config) {
     warmCacheInBackground(config);
   }
 
-  throw new Error(`Not found in Notion DB (docId: ${docFileId.slice(0,12)}…). Try ↻ Rebuild Cache if this is a new card.`);
+  throw new Error(await diagnoseNotFound(docFileId, config));
 }
 
 // Refresh a stale cache without making any caller wait for it.
 function warmCacheInBackground(config) {
   if (cacheIsValid() || _buildInProgress) return;
   notionBuildCache(config).catch(() => {});
+}
+
+// Explain WHY a doc could not be found, instead of a generic "rebuild cache".
+async function diagnoseNotFound(docFileId, config) {
+  const base = `Not found in Notion DB (docId: ${docFileId.slice(0,12)}…).`;
+  try {
+    if (!Object.keys(_schemaTypes).length) await ensureSchema(config);
+    const names = Object.keys(_schemaTypes);
+    if (!names.length) {
+      return base + ' Could not read the database schema — check the API key, Database ID, and that the integration is connected to this database.';
+    }
+    const want = (config.propFinalDoc || '').toLowerCase().trim();
+    const propName = _schemaTypes[config.propFinalDoc] !== undefined
+      ? config.propFinalDoc
+      : names.find(n => n.toLowerCase().trim() === want);
+    if (!propName) {
+      const docLike = names.filter(n => /doc|link|url|content/i.test(n));
+      return base + ` Property "${config.propFinalDoc}" does not exist in this database. ` +
+        (docLike.length ? `Did you mean: ${docLike.join(', ')}? ` : '') +
+        'Fix the Final Doc property name in ⚙ Settings.';
+    }
+    return base + ` Property "${propName}" (type: ${_schemaTypes[propName]}) exists but no card contains this doc ID — ` +
+      'the Notion card may link a DIFFERENT doc than the email (e.g. a copied doc). ' +
+      'Open the card and compare its doc URL with the email’s.';
+  } catch (e) {
+    return base + ' Try ↻ Rebuild Cache if this is a new card.';
+  }
 }
 
 // ── BATCH FETCH ───────────────────────────────────────────────────────────────
@@ -512,7 +556,7 @@ async function notionFetchBatch(docUrls, config) {
         const cached = lookupDoc(docUrl);
         results[docUrl] = cached
           ? cachedResult(cached, docFileId)
-          : { ok:false, error:`Not found (docId: ${docFileId.slice(0,12)}…). Rebuild Cache.` };
+          : { ok:false, error: await diagnoseNotFound(docFileId, config) };
       }
     }
   }
