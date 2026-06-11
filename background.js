@@ -353,23 +353,26 @@ async function notionBuildCache(config) {
   } finally { _buildInProgress = false; }
 }
 
-// ── DIRECT API SEARCH — last resort ──────────────────────────────────────────
+// ── DIRECT API SEARCH — primary lookup path (v27.1) ─────────────────────────────
+// One filtered databases/query call resolves a doc in ~0.5s, instead of
+// paginating the whole DB. Filter strategies run in parallel because the
+// Final Doc property may be rich_text, url, or formula — wrong-type filters
+// just return a 400 and are ignored.
 async function notionDirectSearch(docUrl, docFileId, config) {
   if (!docFileId) return null;
   const headers = notionHeaders(config.apiKey);
 
-  // Try two filter strategies
   const filters = [
     { property: config.propFinalDoc, rich_text:{ contains: docFileId } },
     { property: config.propFinalDoc, url:{ contains: docFileId } },
+    { property: config.propFinalDoc, formula:{ string:{ contains: docFileId } } },
   ];
 
-  // v27: Run all filters in PARALLEL for speed
   const searchResults = await Promise.allSettled(
     filters.map(filter =>
       notionFetchHttp(
         `https://api.notion.com/v1/databases/${config.databaseId}/query`,
-        { method:'POST', headers, body:JSON.stringify({ page_size:10, filter }) }
+        { method:'POST', headers, body:JSON.stringify({ page_size:5, filter }) }
       )
     )
   );
@@ -427,21 +430,38 @@ async function notionFetchCard(docUrl, config) {
     return toResult(cached, true);
   }
 
-  // Step 2: run incremental OR full rebuild depending on cache age
-  const cacheAge2 = _fetchedAt ? (Date.now() - _fetchedAt) : Infinity;
-  if (!cacheIsValid()) {
-    await notionBuildCache(config);
-  } else if (incrementalSyncDue() && cacheAge2 >= 60_000) {
-    await notionIncrementalSync(config);
+  // Step 2 (v27.1): targeted filtered query FIRST — one API round-trip.
+  // Querying with a filter is how the Notion API is meant to be used for
+  // lookups; scanning the whole DB into a cache is only a fallback.
+  const direct = await notionDirectSearch(normDocUrl, docFileId, config);
+  if (direct) {
+    warmCacheInBackground(config);
+    return { ...direct, docFileId, fromCache:false };
   }
+
+  // Step 3: lightweight incremental sync (recent ~300 pages), then re-check.
+  // Covers cards whose Final Doc property type defeats the filter.
+  await notionIncrementalSync(config);
   cached = lookupDoc(normDocUrl) || lookupDoc(docUrl);
   if (cached) return toResult(cached, false);
 
-  // Step 3: targeted direct API search (fastest path for cache misses)
-  const direct = await notionDirectSearch(normDocUrl, docFileId, config);
-  if (direct) return { ...direct, docFileId, fromCache:false };
+  // Step 4: full DB scan ONLY if the cache has never been built (first run).
+  // A stale cache is refreshed in the background instead of blocking here.
+  if (!_fetchedAt) {
+    await notionBuildCache(config);
+    cached = lookupDoc(normDocUrl) || lookupDoc(docUrl);
+    if (cached) return toResult(cached, false);
+  } else {
+    warmCacheInBackground(config);
+  }
 
   throw new Error(`Not found in Notion DB (docId: ${docFileId.slice(0,12)}…). Try ↻ Rebuild Cache if this is a new card.`);
+}
+
+// Refresh a stale cache without making any caller wait for it.
+function warmCacheInBackground(config) {
+  if (cacheIsValid() || _buildInProgress) return;
+  notionBuildCache(config).catch(() => {});
 }
 
 // ── BATCH FETCH ───────────────────────────────────────────────────────────────
@@ -450,51 +470,51 @@ async function notionFetchBatch(docUrls, config) {
   if (!config.databaseId) throw new Error('Notion Database ID not set.');
   await loadCacheFromStorage();
 
-  // v27: Only do incremental sync if cache exists and sync is due.
-  // Skip both if cache was built in the last 60s (just rebuilt).
-  const cacheAge = _fetchedAt ? (Date.now() - _fetchedAt) : Infinity;
-  const justBuilt = cacheAge < 60_000;
-  if (!justBuilt) {
-    if (!cacheIsValid()) {
-      // Full rebuild — cache is stale or empty
-      await notionBuildCache(config);
-    } else if (incrementalSyncDue()) {
-      // Lightweight incremental — only fetch recently edited pages
-      await notionIncrementalSync(config);
-    }
-  }
+  // v27.1: NEVER block the batch on a cache build. Serve cache hits instantly,
+  // resolve misses with parallel filtered queries, refresh the cache in the
+  // background for next time.
+  if (_fetchedAt && incrementalSyncDue()) notionIncrementalSync(config).catch(() => {});
+  warmCacheInBackground(config);
 
   const results = {};
   const missing = [];
+
+  const cachedResult = (cached, docFileId) => ({
+    ok:true, pageId:cached.pageId, actualPaid:cached.actualPaid,
+    currencyType:cached.currencyType, postType:cached.postType, orderIn:cached.orderIn,
+    orderUrl:cached.orderUrl, txnDetails:cached.txnDetails, clientSheet:cached.clientSheet,
+    pageUrl:cached.pageUrl, docFileId });
 
   for (const docUrl of docUrls) {
     const docFileId = extractDocFileId(docUrl);
     if (!docFileId) { results[docUrl] = { ok:false, error:'Invalid doc URL' }; continue; }
     const cached = lookupDoc(docUrl);
-    if (cached) {
-      results[docUrl] = { ok:true, pageId:cached.pageId, actualPaid:cached.actualPaid,
-        currencyType:cached.currencyType, postType:cached.postType, orderIn:cached.orderIn,
-        orderUrl:cached.orderUrl, txnDetails:cached.txnDetails, clientSheet:cached.clientSheet,
-        pageUrl:cached.pageUrl, docFileId };
-    } else {
-      missing.push({ docUrl, docFileId });
-    }
+    if (cached) results[docUrl] = cachedResult(cached, docFileId);
+    else missing.push({ docUrl, docFileId });
   }
 
-  // Parallel direct API searches for anything still missing (v27: was serial)
+  // Parallel direct API searches for anything still missing
   if (missing.length > 0) {
     await Promise.allSettled(
       missing.map(async ({ docUrl, docFileId }) => {
         try {
           const direct = await notionDirectSearch(docUrl, docFileId, config);
-          if (direct) {
-            results[docUrl] = { ok:true, ...direct, docFileId };
-          } else {
-            results[docUrl] = { ok:false, error:`Not found (docId: ${docFileId.slice(0,12)}…). Rebuild Cache.` };
-          }
+          if (direct) results[docUrl] = { ok:true, ...direct, docFileId };
         } catch(e) { results[docUrl] = { ok:false, error:e.message }; }
       })
     );
+
+    // Still unresolved → one incremental sync (recent ~300 pages), re-check
+    const still = missing.filter(m => !results[m.docUrl]);
+    if (still.length > 0) {
+      await notionIncrementalSync(config).catch(() => {});
+      for (const { docUrl, docFileId } of still) {
+        const cached = lookupDoc(docUrl);
+        results[docUrl] = cached
+          ? cachedResult(cached, docFileId)
+          : { ok:false, error:`Not found (docId: ${docFileId.slice(0,12)}…). Rebuild Cache.` };
+      }
+    }
   }
   return results;
 }
