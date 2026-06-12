@@ -572,9 +572,11 @@ async function notionDirectSearch(docUrl, docFileId, config) {
     } catch(e) { console.warn('[GPL bg] Direct search parse failed:', e.message); }
   }
 
-  // Final stage: the doc id may exist ONLY in a related database (e.g. the
-  // Writers DB) — search there, then hop back to the order page.
-  return await notionRelationHopSearch(docFileId, config);
+  // Final stages — only reached when the original DB yields nothing:
+  // generic relation hop, then the hardcoded Writers DB resolution chain.
+  const hop = await notionRelationHopSearch(docFileId, config);
+  if (hop) return hop;
+  return await notionWritersDbSearch(docFileId, config);
 }
 
 function entryToSearchResult(entry) {
@@ -599,27 +601,11 @@ async function notionRelationHopSearch(docFileId, config) {
 
   for (const [relProp, relDbId] of Object.entries(_schemaRelations)) {
     try {
-      // Related DB schema (cached in memory)
-      let relTypes = _relDbSchemas[relDbId];
-      if (!relTypes) {
-        const r = await notionFetchHttp(`https://api.notion.com/v1/databases/${relDbId}`,
-          { method:'GET', headers });
-        if (!r.ok) continue;
-        const d = await r.json();
-        relTypes = {};
-        for (const [n, p] of Object.entries(d.properties || {})) relTypes[n] = p.type;
-        _relDbSchemas[relDbId] = relTypes;
-      }
+      const relTypes = await getDbSchema(relDbId, headers);
+      if (!relTypes) continue;
 
       // Search the related DB for the doc id across its text-bearing props
-      const relFilters = [];
-      for (const [n, t] of Object.entries(relTypes)) {
-        if (relFilters.length >= 8) break;
-        if (t === 'title')          relFilters.push({ property:n, title:{ contains:docFileId } });
-        else if (t === 'rich_text') relFilters.push({ property:n, rich_text:{ contains:docFileId } });
-        else if (t === 'url')       relFilters.push({ property:n, url:{ contains:docFileId } });
-        else if (t === 'formula')   relFilters.push({ property:n, formula:{ string:{ contains:docFileId } } });
-      }
+      const relFilters = buildTextFilters(relTypes, docFileId);
       if (!relFilters.length) continue;
 
       const relSettled = await Promise.allSettled(relFilters.map(f => notionFetchHttp(
@@ -662,6 +648,150 @@ async function notionRelationHopSearch(docFileId, config) {
     } catch(e) { console.warn(`[GPL bg] Relation-hop via "${relProp}" failed:`, e.message); }
   }
   return null;
+}
+
+// ── SHARED SCHEMA/FILTER HELPERS ─────────────────────────────────────────────
+async function getDbSchema(dbId, headers) {
+  if (_relDbSchemas[dbId]) return _relDbSchemas[dbId];
+  try {
+    const r = await notionFetchHttp(`https://api.notion.com/v1/databases/${dbId}`, { method:'GET', headers });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const types = {};
+    for (const [n, p] of Object.entries(d.properties || {})) types[n] = p.type;
+    _relDbSchemas[dbId] = types;
+    return types;
+  } catch { return null; }
+}
+
+function buildTextFilters(types, docFileId, max = 8) {
+  const filters = [];
+  for (const [n, t] of Object.entries(types)) {
+    if (filters.length >= max) break;
+    if (t === 'title')          filters.push({ property:n, title:{ contains:docFileId } });
+    else if (t === 'rich_text') filters.push({ property:n, rich_text:{ contains:docFileId } });
+    else if (t === 'url')       filters.push({ property:n, url:{ contains:docFileId } });
+    else if (t === 'formula')   filters.push({ property:n, formula:{ string:{ contains:docFileId } } });
+  }
+  return filters;
+}
+
+function findProp(props, wanted) {
+  if (props[wanted]) return props[wanted];
+  const lk = wanted.toLowerCase().trim();
+  for (const [n, v] of Object.entries(props)) if (n.toLowerCase().trim() === lk) return v;
+  return null;
+}
+
+// ── WRITERS DB FALLBACK (hardcoded resolution chain) ─────────────────────────
+// When the orders DB yields nothing for a doc id, the doc lives on a page in
+// the Writers DB. That page's "2026 Order Management" property points back to
+// the order page — as a relation, a link/mention, or just the order's NAME.
+// Resolution: find writer page by doc id → follow the pointer → cache order.
+const WRITERS_DB_ID   = '31fe3318538143458a8d4dfec9444b1c';
+const ORDER_LINK_PROP = '2026 Order Management';
+const NOTION_UUID_RX  = /[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}/gi;
+
+async function notionWritersDbSearch(docFileId, config) {
+  if (!docFileId) return null;
+  const headers = notionHeaders(config.apiKey);
+  try {
+    const wTypes = await getDbSchema(WRITERS_DB_ID, headers);
+    if (!wTypes) {
+      console.warn('[GPL bg] Writers DB not accessible — connect the integration to it in Notion');
+      return null;
+    }
+
+    // 1. Find the writer page(s) containing this doc id
+    const filters = buildTextFilters(wTypes, docFileId);
+    if (!filters.length) return null;
+    const settled = await Promise.allSettled(filters.map(f => notionFetchHttp(
+      `https://api.notion.com/v1/databases/${WRITERS_DB_ID}/query`,
+      { method:'POST', headers, body:JSON.stringify({ page_size:3, filter:f }) }
+    )));
+    const writerPages = [];
+    const seenW = new Set();
+    for (const s of settled) {
+      if (s.status !== 'fulfilled' || !s.value.ok) continue;
+      try {
+        const d = await s.value.json();
+        for (const pg of (d.results || [])) if (!seenW.has(pg.id)) { seenW.add(pg.id); writerPages.push(pg); }
+      } catch {}
+    }
+    if (!writerPages.length) { console.log('[GPL bg] Writers DB: doc not found'); return null; }
+    console.log(`[GPL bg] Writers DB: ${writerPages.length} writer page(s) contain the doc`);
+
+    const docUrlCanonical = 'https://docs.google.com/document/d/' + docFileId + '/edit';
+
+    for (const wp of writerPages.slice(0, 3)) {
+      const linkProp = findProp(wp.properties || {}, ORDER_LINK_PROP);
+      if (!linkProp) { console.warn(`[GPL bg] Writers DB: "${ORDER_LINK_PROP}" prop missing on writer page`); continue; }
+
+      // 2a. Relation → order page id(s) directly
+      let orderIds = [];
+      if (linkProp.type === 'relation') {
+        orderIds = (linkProp.relation || []).map(r => r?.id).filter(Boolean);
+      }
+
+      // 2b. Otherwise: any Notion page id / notion.so link inside the value
+      if (!orderIds.length) {
+        const raw = JSON.stringify(linkProp);
+        const ids = (raw.match(NOTION_UUID_RX) || []).map(x => x.replace(/-/g, '').toLowerCase());
+        orderIds = [...new Set(ids)].filter(x => x !== wp.id.replace(/-/g, '').toLowerCase());
+      }
+
+      for (const oid of orderIds.slice(0, 3)) {
+        const result = await fetchOrderPageById(oid, config, docUrlCanonical);
+        if (result) return result;
+      }
+
+      // 2c. Plain text → it's the order's NAME; look it up in the main DB title
+      const name = getPropText(linkProp).trim();
+      if (name && name.length >= 3 && !/^https?:/i.test(name)) {
+        if (!Object.keys(_schemaTypes).length) await ensureSchema(config);
+        const titleProp = Object.keys(_schemaTypes).find(n => _schemaTypes[n] === 'title') || 'Name';
+        const res = await notionFetchHttp(
+          `https://api.notion.com/v1/databases/${config.databaseId}/query`,
+          { method:'POST', headers,
+            body:JSON.stringify({ page_size:3, filter:{ property:titleProp, title:{ contains:name.slice(0,80) } } }) }
+        );
+        if (res.ok) {
+          const d = await res.json();
+          for (const page of (d.results || [])) {
+            const result = cacheOrderPage(page, config, docUrlCanonical, `name "${name.slice(0,40)}"`);
+            if (result) return result;
+          }
+        }
+      }
+    }
+  } catch(e) { console.warn('[GPL bg] Writers DB search failed:', e.message); }
+  return null;
+}
+
+async function fetchOrderPageById(pageId, config, docUrlCanonical) {
+  try {
+    const headers = notionHeaders(config.apiKey);
+    const res = await notionFetchHttp(`https://api.notion.com/v1/pages/${pageId}`, { method:'GET', headers });
+    if (!res.ok) return null;
+    const page = await res.json();
+    // Only accept pages that actually belong to the orders database
+    const parentDb = (page.parent?.database_id || '').replace(/-/g, '').toLowerCase();
+    if (parentDb && parentDb !== (config.databaseId || '').replace(/-/g, '').toLowerCase()) return null;
+    return cacheOrderPage(page, config, docUrlCanonical, 'page link');
+  } catch { return null; }
+}
+
+// The writer page's pointer explicitly maps this doc to this order, so index
+// the entry under the searched doc id even if the order page also carries its
+// own (e.g. copied) doc URL.
+function cacheOrderPage(page, config, docUrlCanonical, via) {
+  const parsed = pageEntryFromNotion(page, config, docUrlCanonical);
+  if (!parsed) return null;
+  const keys = new Set([...parsed.keys, ...allDocKeys(docUrlCanonical)]);
+  for (const key of keys) _pages[key] = parsed.entry;
+  saveCacheToStorage();
+  console.log(`[GPL bg] Writers DB: order ${page.id.slice(0,8)} resolved via ${via}`);
+  return entryToSearchResult(parsed.entry);
 }
 
 // ── FETCH SINGLE CARD ─────────────────────────────────────────────────────────
