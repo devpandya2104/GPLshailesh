@@ -11,6 +11,8 @@ const SCHEMA_KEY = 'oleNotionSchema';
 
 let _pages = {}, _fetchedAt = null, _incrementalAt = null;
 let _schemaTypes = {}, _cacheLoaded = false, _buildInProgress = false;
+let _schemaRelations = {};   // relation prop name -> related database id
+const _relDbSchemas = {};    // related database id -> { propName: type }
 
 // ── STORAGE ───────────────────────────────────────────────────────────────────
 async function loadCacheFromStorage() {
@@ -22,7 +24,11 @@ async function loadCacheFromStorage() {
       _fetchedAt    = s[CACHE_KEY].fetchedAt    || null;
       _incrementalAt= s[CACHE_KEY].incrementalAt|| null;
     }
-    if (s[SCHEMA_KEY]) _schemaTypes = s[SCHEMA_KEY] || {};
+    if (s[SCHEMA_KEY]) {
+      const sc = s[SCHEMA_KEY];
+      if (sc.types) { _schemaTypes = sc.types || {}; _schemaRelations = sc.relations || {}; }
+      else _schemaTypes = sc || {};   // legacy shape
+    }
     _cacheLoaded = true;
     console.log(`[GPL bg] Cache loaded: ${Object.keys(_pages).length} keys, fetched=${_fetchedAt ? new Date(_fetchedAt).toISOString() : 'never'}`);
   } catch(e) { _cacheLoaded = true; }
@@ -35,7 +41,7 @@ async function saveCacheToStorage() {
   } catch(e) { console.warn('[GPL bg] save failed:', e.message); }
 }
 async function saveSchemaToStorage() {
-  try { await chrome.storage.local.set({ [SCHEMA_KEY]: _schemaTypes }); } catch {}
+  try { await chrome.storage.local.set({ [SCHEMA_KEY]: { types:_schemaTypes, relations:_schemaRelations } }); } catch {}
 }
 function cacheIsValid()       { return !!_fetchedAt && (Date.now() - _fetchedAt    < CACHE_TTL); }
 function incrementalSyncDue() { return !_incrementalAt || (Date.now() - _incrementalAt > INCREMENTAL_TTL); }
@@ -388,9 +394,15 @@ async function ensureSchema(config) {
     if (!res.ok) return;
     const dbData = await res.json();
     _schemaTypes = {};
-    for (const [name, prop] of Object.entries(dbData.properties || {})) _schemaTypes[name] = prop.type;
+    _schemaRelations = {};
+    for (const [name, prop] of Object.entries(dbData.properties || {})) {
+      _schemaTypes[name] = prop.type;
+      if (prop.type === 'relation' && prop.relation?.database_id) {
+        _schemaRelations[name] = prop.relation.database_id;
+      }
+    }
     await saveSchemaToStorage();
-    console.log('[GPL bg] Schema:', JSON.stringify(_schemaTypes));
+    console.log('[GPL bg] Schema:', JSON.stringify(_schemaTypes), 'relations:', JSON.stringify(_schemaRelations));
   } catch(e) { console.warn('[GPL bg] Schema failed:', e.message); }
 }
 
@@ -442,7 +454,7 @@ async function notionBuildCache(config) {
   const headers = notionHeaders(config.apiKey);
   let cursor = null, hasMore = true, total = 0;
   const newPages = {};
-  const relCache = {}, relCap = { used: 0, cap: 200 };
+  const relCache = {}, relCap = { used: 0, cap: 500 };
   try {
     while (hasMore) {
       const payload = { page_size:100 };
@@ -555,13 +567,99 @@ async function notionDirectSearch(docUrl, docFileId, config) {
         for (const key of parsed.keys) _pages[key] = parsed.entry;
         saveCacheToStorage(); // async, don't await
         console.log(`[GPL bg] Direct search found pageId=${page.id.slice(0,8)}`);
-        return { pageId:parsed.entry.pageId, actualPaid:parsed.entry.actualPaid,
-                 currencyType:parsed.entry.currencyType, postType:parsed.entry.postType,
-                 orderIn:parsed.entry.orderIn, orderUrl:parsed.entry.orderUrl,
-                 txnDetails:parsed.entry.txnDetails, clientSheet:parsed.entry.clientSheet,
-                 pageUrl:parsed.entry.pageUrl };
+        return entryToSearchResult(parsed.entry);
       }
     } catch(e) { console.warn('[GPL bg] Direct search parse failed:', e.message); }
+  }
+
+  // Final stage: the doc id may exist ONLY in a related database (e.g. the
+  // Writers DB) — search there, then hop back to the order page.
+  return await notionRelationHopSearch(docFileId, config);
+}
+
+function entryToSearchResult(entry) {
+  return { pageId:entry.pageId, actualPaid:entry.actualPaid,
+           currencyType:entry.currencyType, postType:entry.postType,
+           orderIn:entry.orderIn, orderUrl:entry.orderUrl,
+           txnDetails:entry.txnDetails, clientSheet:entry.clientSheet,
+           pageUrl:entry.pageUrl };
+}
+
+// ── TWO-HOP RELATION SEARCH ───────────────────────────────────────────────────
+// For order pages whose Final Doc formula evaluates empty via the API and
+// whose doc URL lives on a RELATED page (e.g. "From Writers" rollup), no
+// filter on the orders DB can match. Instead:
+//   1. search each related database directly for the doc id (~1 query each)
+//   2. hop back: query the orders DB with relation contains <matched page id>
+// Cost is a handful of API calls regardless of database size.
+async function notionRelationHopSearch(docFileId, config) {
+  if (!docFileId) return null;
+  const headers = notionHeaders(config.apiKey);
+  if (!Object.keys(_schemaRelations).length) await ensureSchema(config);
+
+  for (const [relProp, relDbId] of Object.entries(_schemaRelations)) {
+    try {
+      // Related DB schema (cached in memory)
+      let relTypes = _relDbSchemas[relDbId];
+      if (!relTypes) {
+        const r = await notionFetchHttp(`https://api.notion.com/v1/databases/${relDbId}`,
+          { method:'GET', headers });
+        if (!r.ok) continue;
+        const d = await r.json();
+        relTypes = {};
+        for (const [n, p] of Object.entries(d.properties || {})) relTypes[n] = p.type;
+        _relDbSchemas[relDbId] = relTypes;
+      }
+
+      // Search the related DB for the doc id across its text-bearing props
+      const relFilters = [];
+      for (const [n, t] of Object.entries(relTypes)) {
+        if (relFilters.length >= 8) break;
+        if (t === 'title')          relFilters.push({ property:n, title:{ contains:docFileId } });
+        else if (t === 'rich_text') relFilters.push({ property:n, rich_text:{ contains:docFileId } });
+        else if (t === 'url')       relFilters.push({ property:n, url:{ contains:docFileId } });
+        else if (t === 'formula')   relFilters.push({ property:n, formula:{ string:{ contains:docFileId } } });
+      }
+      if (!relFilters.length) continue;
+
+      const relSettled = await Promise.allSettled(relFilters.map(f => notionFetchHttp(
+        `https://api.notion.com/v1/databases/${relDbId}/query`,
+        { method:'POST', headers, body:JSON.stringify({ page_size:3, filter:f }) }
+      )));
+      const relPageIds = [];
+      for (const s of relSettled) {
+        if (s.status !== 'fulfilled' || !s.value.ok) continue;
+        try {
+          const d = await s.value.json();
+          for (const pg of (d.results || [])) if (!relPageIds.includes(pg.id)) relPageIds.push(pg.id);
+        } catch {}
+      }
+      if (!relPageIds.length) continue;
+      console.log(`[GPL bg] Relation-hop: doc found in related DB via "${relProp}" (${relPageIds.length} page(s))`);
+
+      // Hop back: order pages related to the matched page(s)
+      for (const pid of relPageIds.slice(0, 3)) {
+        const res = await notionFetchHttp(
+          `https://api.notion.com/v1/databases/${config.databaseId}/query`,
+          { method:'POST', headers,
+            body:JSON.stringify({ page_size:3, filter:{ property:relProp, relation:{ contains:pid } } }) }
+        );
+        if (!res.ok) continue;
+        const data = await res.json();
+        for (const page of (data.results || [])) {
+          const parsed = pageEntryFromNotion(page, config,
+            'https://docs.google.com/document/d/' + docFileId + '/edit');
+          if (!parsed) continue;
+          // The order page might carry its OWN (different) doc — only accept
+          // it if it actually indexes under the doc id we searched for
+          if (!parsed.keys.includes(docFileId)) continue;
+          for (const key of parsed.keys) _pages[key] = parsed.entry;
+          saveCacheToStorage();
+          console.log(`[GPL bg] Relation-hop found order pageId=${page.id.slice(0,8)} via "${relProp}"`);
+          return entryToSearchResult(parsed.entry);
+        }
+      }
+    } catch(e) { console.warn(`[GPL bg] Relation-hop via "${relProp}" failed:`, e.message); }
   }
   return null;
 }
