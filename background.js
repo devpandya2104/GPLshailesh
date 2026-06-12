@@ -101,6 +101,20 @@ function extractDocFileId(url) {
   return null;
 }
 
+// Find a Google-Doc-shaped id token anywhere in arbitrary text (formula output
+// that is a bare id or id with surrounding words). Conservative: requires a
+// hyphen/underscore or length ≥ 30 so it does not grab random alphanumerics.
+function looseGoogleDocId(text) {
+  if (!text || typeof text !== 'string') return null;
+  const direct = extractDocFileId(text);
+  if (direct) return direct;
+  const tokens = text.match(/[a-zA-Z0-9_-]{25,}/g) || [];
+  for (const t of tokens) {
+    if (t.length >= 30 || /[-_]/.test(t)) return t;
+  }
+  return null;
+}
+
 // Normalise google.com/open?id= and drive links to canonical docs URL
 function normaliseDocUrl(url) {
   if (!url) return url;
@@ -177,6 +191,16 @@ function pageEntryFromNotion(page, config) {
         console.log(`[GPL bg] Found doc URL in prop "${propName}": ${val.slice(0,60)}`);
         break;
       }
+    }
+  }
+
+  // Last resort: a formula may output a BARE id ("1xm-ZEHsDN6…") or an id with
+  // surrounding text ("Doc: 1xm…") that the URL patterns above miss. Scan every
+  // property's text for a Google-Doc-shaped id token and rebuild a canonical URL.
+  if (!finalDocValue || !extractDocFileId(finalDocValue)) {
+    for (const propVal of Object.values(props)) {
+      const id = looseGoogleDocId(getPropText(propVal));
+      if (id) { finalDocValue = 'https://docs.google.com/document/d/' + id + '/edit'; break; }
     }
   }
 
@@ -462,14 +486,15 @@ async function notionFetchCard(docUrl, config) {
   cached = lookupDoc(normDocUrl) || lookupDoc(docUrl);
   if (cached) return toResult(cached, false);
 
-  // Step 4: full DB scan ONLY if the cache has never been built (first run).
-  // A stale cache is refreshed in the background instead of blocking here.
-  if (!_fetchedAt) {
+  // Step 4: full DB scan fallback. The filtered query (step 2) cannot reliably
+  // match formula-type Final Doc properties, so before declaring "not found" we
+  // do one authoritative full scan — but skip it if the cache was just built
+  // (<2min ago) so a genuinely-missing doc doesn't trigger repeated scans.
+  const justBuilt = _fetchedAt && (Date.now() - _fetchedAt < 2 * 60 * 1000);
+  if (!justBuilt) {
     await notionBuildCache(config);
     cached = lookupDoc(normDocUrl) || lookupDoc(docUrl);
     if (cached) return toResult(cached, false);
-  } else {
-    warmCacheInBackground(config);
   }
 
   throw new Error(await diagnoseNotFound(docFileId, config));
@@ -548,10 +573,20 @@ async function notionFetchBatch(docUrls, config) {
       })
     );
 
-    // Still unresolved → one incremental sync (recent ~300 pages), re-check
-    const still = missing.filter(m => !results[m.docUrl]);
+    // Still unresolved → incremental sync, then ONE authoritative full scan
+    // (catches formula-type docs the filter can't match), then final verdict.
+    let still = missing.filter(m => !results[m.docUrl]);
     if (still.length > 0) {
       await notionIncrementalSync(config).catch(() => {});
+      still = still.filter(m => {
+        const cached = lookupDoc(m.docUrl);
+        if (cached) { results[m.docUrl] = cachedResult(cached, m.docFileId); return false; }
+        return true;
+      });
+    }
+    if (still.length > 0) {
+      const justBuilt = _fetchedAt && (Date.now() - _fetchedAt < 2 * 60 * 1000);
+      if (!justBuilt) await notionBuildCache(config).catch(() => {});
       for (const { docUrl, docFileId } of still) {
         const cached = lookupDoc(docUrl);
         results[docUrl] = cached

@@ -598,17 +598,19 @@ async function doDisambiguateSameDomain(){
       refreshDebug(i);
     }
 
-    // Members whose link was claimed by a title match get a leftover candidate
+    // If a title match stole the link another order was showing, try to hand
+    // that order a still-unused same-domain candidate. NEVER null an existing
+    // live link here — a wrong-but-present link is better than erasing one, and
+    // erasing it also suppressed validation. Leave it untouched if nothing free.
     for(const i of idxs){
       if(assign[i]!==undefined)continue;
       const o=orders[i];
-      if(o.liveUrl&&usedU.has(o.liveUrl)&&!(o._titleMatched)){
-        const free=candList.find(u=>!usedU.has(u)&&!idxs.some(j=>j!==i&&orders[j].liveUrl===u));
-        o.liveUrl=free||null;
-        if(free)usedU.add(free);
-        o.matchConfidence=free?'low':'none';
-        changed++;
-        refreshFields(i);updateConfBadge(i,o);
+      if(o.liveUrl&&usedU.has(o.liveUrl)&&!o._titleMatched){
+        const free=candList.find(u=>!usedU.has(u)&&!idxs.some(j=>orders[j].liveUrl===u));
+        if(free){
+          o.liveUrl=free;usedU.add(free);o.matchConfidence='low';
+          changed++;refreshFields(i);updateConfBadge(i,o);
+        }
       }
     }
     if(changed)toast(`✓ ${changed} live link${changed>1?'s':''} re-matched by doc title`,3000);
@@ -635,12 +637,11 @@ async function doScan(){
       await chrome.scripting.executeScript({target:{tabId:tab.id},files:['content.js']});
       await wait(1500); result=await msgTab(tab.id,{action:'scan'},9000);
     }
-    if(result?.orders){render(result);}
-    else{
-      const{oleData}=await chrome.storage.local.get('oleData');
-      if(oleData?.orders?.some(o=>o.publisherSite||o.docUrl||o.liveUrl||o.invoiceUrl))render(oleData);
-      else{stLoadEl.style.display='none';stEmptyEl.style.display='flex';emptyTitle.textContent='No data found';setStatus('empty','Nothing found');}
-    }
+    // Always render the FRESH scan result (even if empty). Never fall back to
+    // the previous thread's data from storage — that was the "keeps old orders
+    // after switching tab/email" bug.
+    if(result&&Array.isArray(result.orders)){render(result);}
+    else{stLoadEl.style.display='none';stEmptyEl.style.display='flex';emptyTitle.textContent='No data found';emptyHint.innerHTML='Open a thread then click <strong>Scan</strong>.';setStatus('empty','Nothing found');}
   }catch(err){
     stLoadEl.style.display='none';stEmptyEl.style.display='flex';
     emptyTitle.textContent='Scan error';emptyHint.textContent=err.message;
@@ -992,10 +993,21 @@ btnClear.addEventListener('click',()=>{
   Object.keys(notionLog).forEach(k=>delete notionLog[k]);
 });
 
+function clearPerOrderState(){
+  Object.keys(notionState).forEach(k=>delete notionState[k]);
+  Object.keys(manualOverrides).forEach(k=>delete manualOverrides[k]);
+  Object.keys(notionLog).forEach(k=>delete notionLog[k]);
+}
+
 chrome.storage.onChanged.addListener(({oleData})=>{
   if(!oleData?.newValue)return;
   const d=oleData.newValue;
-  if(d.switching){resultsEl.innerHTML='';stEmptyEl.style.display='none';stLoadEl.style.display='flex';footerEl.classList.remove('show');setStatus('scanning','Thread changed…');return;}
+  if(d.switching){
+    // Thread changed — drop the previous thread's Notion/override/log state so
+    // it can't bleed into the new thread's cards (which reuse the same indexes).
+    clearPerOrderState();
+    resultsEl.innerHTML='';stEmptyEl.style.display='none';stLoadEl.style.display='flex';footerEl.classList.remove('show');setStatus('scanning','Thread changed…');return;
+  }
   render(d);
 });
 

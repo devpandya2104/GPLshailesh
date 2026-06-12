@@ -302,7 +302,10 @@
               .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
               .replace(/\u00A0/g, ' ').replace(/\u200B/g, '')
               .replace(/[ \t]{3,}/g, '  ').trim();
-            if (inner.length > 100) {
+            // Keep substantial blocks, but also keep SHORT blocks that contain
+            // a URL — vendor replies are often just "live link:https://…" or
+            // "invoice link:https://…" (<100 chars) and would otherwise be lost.
+            if (inner.length > 100 || (inner.length > 12 && /https?:\/\//i.test(inner))) {
               blocks.push(inner);
             }
             collectEmailBlocks(el.shadowRoot, blocks);
@@ -724,8 +727,12 @@
     if (!ctxOk()) return;
     if (location.href === _lastHref) return;
     _lastHref = location.href;
+    // React to ANY URL change, not only when the parsed thread id differs.
+    // Missive's SPA does not always expose the conversation id in the URL, so
+    // gating on getThreadId() could leave the panel showing the old thread's
+    // orders after a switch. Clearing + rescanning on every href change is
+    // safe because scan() is idempotent.
     const tid = getThreadId();
-    if (tid === _lastTid) return;
     _lastTid = tid;
     safeStorageSet({ oleData: { orders: [], switching: true, scannedAt: Date.now() } });
     schedule(900);
