@@ -173,7 +173,11 @@ function lookupDoc(docUrl) {
 }
 
 // ── BUILD A SINGLE PAGE ENTRY ─────────────────────────────────────────────────
-function pageEntryFromNotion(page, config) {
+const DOC_IN_JSON_RX = /(?:docs\.google\.com\/document\/d\/|\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]{20,})/;
+
+// overrideDocUrl: doc URL resolved externally (e.g. from a related page) when
+// the page's own properties don't expose it.
+function pageEntryFromNotion(page, config, overrideDocUrl) {
   const props = page.properties || {};
 
   // Try the configured Final Doc property name first
@@ -183,13 +187,18 @@ function pageEntryFromNotion(page, config) {
     finalDocValue = getPropText(finalDocProp);
   }
 
-  // Fallback: search ALL properties for a Google Doc/Drive URL in ANY format
-  // (docs.google.com/document, drive.google.com, google.com/open?id=)
+  // Fallback: search ALL properties for a Google DOC/Drive-file URL.
+  // Match the id from an explicit document context — a bare /d/ pattern would
+  // also swallow Client Sheet spreadsheet URLs and mis-index the page.
   if (!finalDocValue || !extractDocFileId(finalDocValue)) {
     for (const [propName, propVal] of Object.entries(props)) {
       const val = getPropText(propVal);
-      if (val && /(?:docs|drive)\.google\.com|google\.com\/open/i.test(val) && extractDocFileId(val)) {
-        finalDocValue = val;
+      if (!val) continue;
+      const dm = val.match(/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]{20,})/i)
+            || val.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([a-zA-Z0-9_-]{20,})/i)
+            || val.match(/(?:^|[^.\w])google\.com\/open\?id=([a-zA-Z0-9_-]{20,})/i);
+      if (dm) {
+        finalDocValue = 'https://docs.google.com/document/d/' + dm[1] + '/edit';
         console.log(`[GPL bg] Found doc URL in prop "${propName}": ${val.slice(0,60)}`);
         break;
       }
@@ -199,9 +208,12 @@ function pageEntryFromNotion(page, config) {
   // Last resort: a formula may output a BARE id ("1xm-ZEHsDN6…") or an id with
   // surrounding text ("Doc: 1xm…") that the URL patterns above miss. Scan every
   // property's text for a Google-Doc-shaped id token and rebuild a canonical URL.
+  // Skip values that are clearly OTHER Google products (sheets/forms/slides).
   if (!finalDocValue || !extractDocFileId(finalDocValue)) {
     for (const propVal of Object.values(props)) {
-      const id = looseGoogleDocId(getPropText(propVal));
+      const val = getPropText(propVal);
+      if (!val || /docs\.google\.com\/(?:spreadsheets|forms|presentation)/i.test(val)) continue;
+      const id = looseGoogleDocId(val);
       if (id) { finalDocValue = 'https://docs.google.com/document/d/' + id + '/edit'; break; }
     }
   }
@@ -212,9 +224,14 @@ function pageEntryFromNotion(page, config) {
   if (!finalDocValue || !extractDocFileId(finalDocValue)) {
     try {
       const raw = JSON.stringify(props);
-      const m = raw.match(/(?:docs\.google\.com\/document\/d\/|\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]{20,})/);
+      const m = raw.match(DOC_IN_JSON_RX);
       if (m) finalDocValue = 'https://docs.google.com/document/d/' + m[1] + '/edit';
     } catch {}
+  }
+
+  // Externally resolved (relation fallback)
+  if ((!finalDocValue || !extractDocFileId(finalDocValue)) && overrideDocUrl) {
+    finalDocValue = overrideDocUrl;
   }
 
   if (!finalDocValue) return null;
@@ -231,6 +248,63 @@ function pageEntryFromNotion(page, config) {
   const pageUrl      = `https://www.notion.so/${page.id.replace(/-/g,'')}`;
 
   return { keys, entry:{ pageId:page.id, actualPaid, currencyType, postType, orderIn, orderUrl, txnDetails, clientSheet, pageUrl, finalDocValue } };
+}
+
+// ── RELATION FALLBACK ─────────────────────────────────────────────────────────
+// Some cards reference their doc only through a relation: a formula like
+//   if( empty(Article DOC), From Writers, Article DOC )
+// where "From Writers" rolls up a related Writers page. Unknown-type formulas
+// often serialise as EMPTY through the API, and the query response carries
+// only the related page's id — so fetch that page and scan it for a doc URL.
+function relationIdsFromPage(page) {
+  const ids = [];
+  for (const propVal of Object.values(page.properties || {})) {
+    if (propVal?.type === 'relation') {
+      for (const r of (propVal.relation || [])) if (r?.id) ids.push(r.id);
+    }
+  }
+  return ids;
+}
+
+async function docUrlFromRelations(page, config, relCache) {
+  const headers = notionHeaders(config.apiKey);
+  for (const rid of relationIdsFromPage(page).slice(0, 5)) {
+    try {
+      let raw = relCache[rid];
+      if (raw === undefined) {
+        const res = await notionFetchHttp(`https://api.notion.com/v1/pages/${rid}`, { method:'GET', headers });
+        raw = res.ok ? JSON.stringify((await res.json()).properties || {}) : '';
+        relCache[rid] = raw;
+      }
+      const m = raw.match(DOC_IN_JSON_RX);
+      if (m) return 'https://docs.google.com/document/d/' + m[1] + '/edit';
+    } catch {}
+  }
+  return null;
+}
+
+// For pages that yielded no doc URL locally, resolve via their relations with
+// limited concurrency. `cap` bounds the extra API calls per build/sync so a DB
+// full of doc-less pages can't stall everything.
+async function resolveMissingViaRelations(pages, parsed, config, relCache, cap) {
+  const idxs = [];
+  for (let i = 0; i < pages.length; i++) {
+    if (!parsed[i] && relationIdsFromPage(pages[i]).length) idxs.push(i);
+  }
+  if (!idxs.length) return;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < idxs.length && cap.used < cap.cap) {
+      const i = idxs[cursor++];
+      cap.used++;
+      const docUrl = await docUrlFromRelations(pages[i], config, relCache);
+      if (docUrl) {
+        parsed[i] = pageEntryFromNotion(pages[i], config, docUrl);
+        if (parsed[i]) console.log(`[GPL bg] Doc resolved via relation for page ${pages[i].id.slice(0,8)}`);
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
 }
 
 // ── MESSAGE ROUTER ────────────────────────────────────────────────────────────
@@ -325,6 +399,7 @@ async function notionIncrementalSync(config) {
   if (!config.apiKey || !config.databaseId) return 0;
   const headers = notionHeaders(config.apiKey);
   let added = 0, cursor = null, page = 0;
+  const relCache = {}, relCap = { used: 0, cap: 40 };
   try {
     while (page < 3) { // fetch up to 300 most-recently-edited pages
       const payload = {
@@ -338,8 +413,10 @@ async function notionIncrementalSync(config) {
       );
       if (!res.ok) break;
       const data = await res.json();
-      for (const p of (data.results || [])) {
-        const parsed = pageEntryFromNotion(p, config);
+      const pages = data.results || [];
+      const parsedList = pages.map(p => pageEntryFromNotion(p, config));
+      await resolveMissingViaRelations(pages, parsedList, config, relCache, relCap);
+      for (const parsed of parsedList) {
         if (!parsed) continue;
         for (const key of parsed.keys) { if (!_pages[key]) added++; _pages[key] = parsed.entry; }
       }
@@ -365,6 +442,7 @@ async function notionBuildCache(config) {
   const headers = notionHeaders(config.apiKey);
   let cursor = null, hasMore = true, total = 0;
   const newPages = {};
+  const relCache = {}, relCap = { used: 0, cap: 200 };
   try {
     while (hasMore) {
       const payload = { page_size:100 };
@@ -378,10 +456,11 @@ async function notionBuildCache(config) {
         throw new Error(`Notion API ${res.status}: ${err.message || res.statusText}`);
       }
       const data = await res.json();
-      // Parse pages in parallel (CPU-bound but still faster than serial)
-      const parsedPages = await Promise.all(
-        (data.results || []).map(p => Promise.resolve(pageEntryFromNotion(p, config)))
-      );
+      const pages = data.results || [];
+      const parsedPages = pages.map(p => pageEntryFromNotion(p, config));
+      // Pages with no readable doc URL: resolve through their relations
+      // (doc may live on the related Writers page) — capped per build
+      await resolveMissingViaRelations(pages, parsedPages, config, relCache, relCap);
       for (const parsed of parsedPages) {
         if (!parsed) continue;
         for (const key of parsed.keys) newPages[key] = parsed.entry;
@@ -399,28 +478,56 @@ async function notionBuildCache(config) {
 
 // ── DIRECT API SEARCH — primary lookup path (v27.1) ─────────────────────────────
 // One filtered databases/query call resolves a doc in ~0.5s, instead of
-// paginating the whole DB. Filter strategies run in parallel because the
-// Final Doc property may be rich_text, url, or formula — wrong-type filters
-// just return a 400 and are ignored.
-async function notionDirectSearch(docUrl, docFileId, config) {
-  if (!docFileId) return null;
-  const headers = notionHeaders(config.apiKey);
+// paginating the whole DB. Filters are built from the DB schema and run in
+// parallel; wrong-type filters just return a 400 and are ignored.
 
-  // Resolve the real property name from the DB schema — tolerates case or
-  // whitespace differences between the configured name and the actual column.
-  if (!Object.keys(_schemaTypes).length) await ensureSchema(config);
+// Filter every doc-ish property by its ACTUAL type. This finds pages whose
+// Final Doc formula evaluates EMPTY through the API (unknown-type formulas)
+// via their source properties instead — e.g. the "Article DOC" url property
+// or the "From Writers" rollup of the related Writers page.
+function buildDocFilters(docFileId, config) {
+  const filters = [];
+  const seen = new Set();
+  const add = (name, type) => {
+    if (!name || seen.has(name + '|' + type)) return;
+    seen.add(name + '|' + type);
+    if (type === 'rich_text')    filters.push({ property:name, rich_text:{ contains:docFileId } });
+    else if (type === 'url')     filters.push({ property:name, url:{ contains:docFileId } });
+    else if (type === 'formula') filters.push({ property:name, formula:{ string:{ contains:docFileId } } });
+    else if (type === 'rollup') {
+      filters.push({ property:name, rollup:{ any:{ rich_text:{ contains:docFileId } } } });
+      filters.push({ property:name, rollup:{ any:{ url:{ contains:docFileId } } } });
+    }
+  };
+
+  // Configured Final Doc property first — resolve the real name from the
+  // schema (tolerates case/whitespace differences with the actual column)
   let propName = config.propFinalDoc;
   if (Object.keys(_schemaTypes).length && _schemaTypes[propName] === undefined) {
     const want = (propName || '').toLowerCase().trim();
     const ci = Object.keys(_schemaTypes).find(n => n.toLowerCase().trim() === want);
     if (ci) { propName = ci; console.log(`[GPL bg] Final Doc prop resolved to "${ci}"`); }
   }
+  const knownType = _schemaTypes[propName];
+  if (knownType) add(propName, knownType);
+  else { add(propName, 'rich_text'); add(propName, 'url'); add(propName, 'formula'); }
 
-  const filters = [
-    { property: propName, rich_text:{ contains: docFileId } },
-    { property: propName, url:{ contains: docFileId } },
-    { property: propName, formula:{ string:{ contains: docFileId } } },
-  ];
+  // Then every other doc-ish property in the schema
+  for (const [name, type] of Object.entries(_schemaTypes)) {
+    if (filters.length >= 10) break;
+    if (name === propName) continue;
+    if (!/doc|link|url|content|writer/i.test(name)) continue;
+    add(name, type);
+  }
+  return filters.slice(0, 10);
+}
+
+async function notionDirectSearch(docUrl, docFileId, config) {
+  if (!docFileId) return null;
+  const headers = notionHeaders(config.apiKey);
+
+  if (!Object.keys(_schemaTypes).length) await ensureSchema(config);
+  const filters = buildDocFilters(docFileId, config);
 
   const searchResults = await Promise.allSettled(
     filters.map(filter =>
