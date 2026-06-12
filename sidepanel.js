@@ -88,6 +88,7 @@ const SETTING_FIELDS={
   cfgWebAppUrl:'webAppUrl',cfgNotionKey:'notionApiKey',cfgNotionDb:'notionDbId',
   cfgPropFinalDoc:'propFinalDoc',cfgPropLiveLink:'propLiveLink',cfgPropInvoice:'propVendorInvoice',
   cfgPropPayment:'propPaymentStatus',cfgPropActualPaid:'propActualPaid',cfgPropCurrency:'propCurrencyType',
+  cfgWritersDb:'writersDbId',cfgWritersDocProp:'writersDocProp',cfgWritersOrderProp:'writersOrderProp',
 };
 // Notion key is stored base64-encoded only so GitHub push protection accepts
 // the commit — it is still a hardcoded secret, decoded at load time below.
@@ -98,7 +99,17 @@ const DEFAULTS={
   notionDbId:'2ddf70d7af0d816e98d4f052cff69104',
   propFinalDoc:'Final Doc',propLiveLink:'Live link',propVendorInvoice:'Vendor Invoice',
   propPaymentStatus:'Payment Status',propActualPaid:'Actual Paid',propCurrencyType:'Currency Type',
+  writersDbId:'31fe3318538143458a8d4dfec9444b1c',
+  writersDocProp:'Completed DOC',
+  writersOrderProp:'2026 Order Management',
 };
+
+// Config shared by every Notion call from the panel
+function notionCfg(){
+  return{apiKey:cfg.notionApiKey,databaseId:cfg.notionDbId,
+    propFinalDoc:cfg.propFinalDoc,propActualPaid:cfg.propActualPaid,propCurrencyType:cfg.propCurrencyType,
+    writersDbId:cfg.writersDbId,writersDocProp:cfg.writersDocProp,writersOrderProp:cfg.writersOrderProp};
+}
 
 async function loadSettings(){
   const s=await chrome.storage.local.get('oleSettings');
@@ -126,7 +137,7 @@ btnRebuild.addEventListener('click',async()=>{
   settingsSt.className='setting-status'; settingsSt.textContent='Fetching…';
   const resp=await new Promise(resolve=>chrome.runtime.sendMessage({
     action:'notionRebuildCache',
-    config:{apiKey:cfg.notionApiKey,databaseId:cfg.notionDbId,propFinalDoc:cfg.propFinalDoc,propActualPaid:cfg.propActualPaid,propCurrencyType:cfg.propCurrencyType}
+    config:notionCfg()
   },res=>resolve(res||{ok:false,error:'No response'})));
   btnRebuild.disabled=false; btnRebuild.textContent='↻ Rebuild Cache';
   if(resp.ok){settingsSt.className='setting-status ok';settingsSt.textContent=`✓ ${resp.count} pages`;toast(`✓ Cached ${resp.count} pages`);}
@@ -666,7 +677,7 @@ async function doNotionFetchBatch(orders){
   const docUrls=orders.map(o=>o.docUrl).filter(Boolean);
   if(!docUrls.length)return;
   orders.forEach((_,i)=>{if(currentData?.orders?.[i]?.docUrl)setNotionLoading(i);});
-  const notionConfig={apiKey:cfg.notionApiKey,databaseId:cfg.notionDbId,propFinalDoc:cfg.propFinalDoc,propActualPaid:cfg.propActualPaid,propCurrencyType:cfg.propCurrencyType};
+  const notionConfig=notionCfg();
   const resp=await new Promise(resolve=>chrome.runtime.sendMessage({action:'notionFetchBatch',docUrls,config:notionConfig},res=>resolve(res||{ok:false,error:'No response'})));
   if(!resp.ok){
     orders.forEach((_,i)=>{if(currentData?.orders?.[i]?.docUrl)setNotionData(i,{error:resp.error||'Fetch failed — check API key & DB ID in Settings'});});
@@ -691,7 +702,7 @@ async function doNotionFetch(idx){
   setNotionLoading(idx);
   const resp=await new Promise(resolve=>chrome.runtime.sendMessage({
     action:'notionFetch',docUrl:o.docUrl,
-    config:{apiKey:cfg.notionApiKey,databaseId:cfg.notionDbId,propFinalDoc:cfg.propFinalDoc,propActualPaid:cfg.propActualPaid,propCurrencyType:cfg.propCurrencyType}
+    config:notionCfg()
   },res=>resolve(res||{ok:false,error:'No response'})));
   if(resp.ok){
     setNotionData(idx,{pageId:resp.pageId,actualPaid:resp.actualPaid,currencyType:resp.currencyType,

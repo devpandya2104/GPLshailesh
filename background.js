@@ -692,40 +692,73 @@ const WRITERS_DB_ID   = '31fe3318538143458a8d4dfec9444b1c';
 const ORDER_LINK_PROP = '2026 Order Management';
 const NOTION_UUID_RX  = /[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}/gi;
 
+let _writersDiag = '';   // last Writers-DB lookup outcome, surfaced by diagnoseNotFound
+
 async function notionWritersDbSearch(docFileId, config) {
   if (!docFileId) return null;
   const headers = notionHeaders(config.apiKey);
+  const writersDbId = ((config.writersDbId || WRITERS_DB_ID) + '').replace(/[^a-zA-Z0-9]/g, '');
+  const docProp     = config.writersDocProp   || 'Completed DOC';
+  const orderProp   = config.writersOrderProp || ORDER_LINK_PROP;
+  _writersDiag = '';
   try {
-    const wTypes = await getDbSchema(WRITERS_DB_ID, headers);
-    if (!wTypes) {
-      console.warn('[GPL bg] Writers DB not accessible — connect the integration to it in Notion');
-      return null;
+    // 1. Find the writer page(s) containing this doc id. Query the configured
+    // doc property DIRECTLY with every plausible type — no schema read needed
+    // (wrong-type filters 400 and are ignored). Schema-driven filters are
+    // added as a bonus when the schema is readable.
+    const filters = [
+      { property: docProp, rich_text:{ contains: docFileId } },
+      { property: docProp, url:{ contains: docFileId } },
+      { property: docProp, formula:{ string:{ contains: docFileId } } },
+      { property: docProp, title:{ contains: docFileId } },
+    ];
+    const wTypes = await getDbSchema(writersDbId, headers);
+    if (wTypes) {
+      for (const f of buildTextFilters(wTypes, docFileId)) {
+        if (filters.length >= 12) break;
+        if (f.property !== docProp) filters.push(f);
+      }
+    } else {
+      console.warn(`[GPL bg] Writers DB schema not readable — querying "${docProp}" directly`);
     }
 
-    // 1. Find the writer page(s) containing this doc id
-    const filters = buildTextFilters(wTypes, docFileId);
-    if (!filters.length) return null;
     const settled = await Promise.allSettled(filters.map(f => notionFetchHttp(
-      `https://api.notion.com/v1/databases/${WRITERS_DB_ID}/query`,
+      `https://api.notion.com/v1/databases/${writersDbId}/query`,
       { method:'POST', headers, body:JSON.stringify({ page_size:3, filter:f }) }
     )));
     const writerPages = [];
     const seenW = new Set();
+    let lastErr = '';
     for (const s of settled) {
-      if (s.status !== 'fulfilled' || !s.value.ok) continue;
+      if (s.status !== 'fulfilled') { lastErr = s.reason?.message || 'network error'; continue; }
+      if (!s.value.ok) {
+        try { const e = await s.value.json(); lastErr = `${s.value.status} ${e.code || ''}: ${e.message || ''}`.trim(); }
+        catch { lastErr = 'HTTP ' + s.value.status; }
+        continue;
+      }
       try {
         const d = await s.value.json();
         for (const pg of (d.results || [])) if (!seenW.has(pg.id)) { seenW.add(pg.id); writerPages.push(pg); }
       } catch {}
     }
-    if (!writerPages.length) { console.log('[GPL bg] Writers DB: doc not found'); return null; }
+    if (!writerPages.length) {
+      _writersDiag = lastErr && !lastErr.startsWith('400')
+        ? `Writers DB query failed (${lastErr}) — check the Writers DB ID and that the integration is connected to it.`
+        : `Doc not found in Writers DB property "${docProp}" either.`;
+      console.log('[GPL bg] Writers DB: ' + _writersDiag);
+      return null;
+    }
     console.log(`[GPL bg] Writers DB: ${writerPages.length} writer page(s) contain the doc`);
 
     const docUrlCanonical = 'https://docs.google.com/document/d/' + docFileId + '/edit';
 
     for (const wp of writerPages.slice(0, 3)) {
-      const linkProp = findProp(wp.properties || {}, ORDER_LINK_PROP);
-      if (!linkProp) { console.warn(`[GPL bg] Writers DB: "${ORDER_LINK_PROP}" prop missing on writer page`); continue; }
+      const linkProp = findProp(wp.properties || {}, orderProp);
+      if (!linkProp) {
+        _writersDiag = `Writer page found, but it has no "${orderProp}" property to point back to the order.`;
+        console.warn('[GPL bg] Writers DB: ' + _writersDiag);
+        continue;
+      }
 
       // 2a. Relation → order page id(s) directly
       let orderIds = [];
@@ -763,8 +796,9 @@ async function notionWritersDbSearch(docFileId, config) {
           }
         }
       }
+      _writersDiag = `Writer page found and "${orderProp}" read, but the order it points to could not be resolved in the main DB.`;
     }
-  } catch(e) { console.warn('[GPL bg] Writers DB search failed:', e.message); }
+  } catch(e) { _writersDiag = 'Writers DB search failed: ' + e.message; console.warn('[GPL bg] ' + _writersDiag); }
   return null;
 }
 
@@ -877,9 +911,7 @@ async function diagnoseNotFound(docFileId, config) {
     return base + ` Property "${propName}" (type: ${t}) exists but no card contains this doc ID — ` +
       'the Notion card may link a DIFFERENT doc than the email (e.g. a copied doc). ' +
       'Open the card and compare its doc URL with the email’s.' +
-      (t === 'formula'
-        ? ' Note: formulas that depend on relations/rollups can return EMPTY through the API even though Notion displays a value — if so, add the raw doc URL to a plain text/URL property as well.'
-        : '');
+      (_writersDiag ? ' ' + _writersDiag : '');
   } catch (e) {
     return base + ' Try ↻ Rebuild Cache if this is a new card.';
   }

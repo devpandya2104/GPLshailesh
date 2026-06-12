@@ -324,6 +324,20 @@ details.debug summary{padding:6px 11px;background:var(--bg2);font-size:11px;font
       <input id="cfgPropCurrency"   class="setting-input" type="text" placeholder="Currency Type" spellcheck="false"/>
     </div>
   </div>
+  <div class="settings-section">
+    <div class="section-title">Writers DB (fallback)</div>
+    <div class="setting-row">
+      <div class="setting-label">Writers Database ID</div>
+      <div class="setting-hint">Searched only when the doc isn't found in the main DB. Connect the integration to this DB in Notion.</div>
+      <input id="cfgWritersDb" class="setting-input" type="text" placeholder="31fe3318538143458a8d4dfec9444b1c" spellcheck="false"/>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">Property names (case-sensitive)</div>
+      <div class="setting-hint">Doc property · link-to-main-DB property</div>
+      <input id="cfgWritersDocProp"   class="setting-input" type="text" placeholder="Completed DOC" spellcheck="false"/>
+      <input id="cfgWritersOrderProp" class="setting-input" type="text" placeholder="2026 Order Management" spellcheck="false"/>
+    </div>
+  </div>
   <div class="setting-save-row">
     <button class="btn-save" id="btnSaveSettings">Save</button>
     <button class="btn-rebuild" id="btnRebuildCache">↻ Rebuild Cache</button>
