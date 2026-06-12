@@ -66,8 +66,10 @@ function getPropText(prop) {
       if (prop.formula?.type === 'number') return String(prop.formula.number ?? '');
       return String(prop.formula?.string || prop.formula?.number || '');
     case 'url':       return prop.url || '';
-    case 'rich_text': return (prop.rich_text || []).map(t => t.plain_text || '').join('');
-    case 'title':     return (prop.title     || []).map(t => t.plain_text || '').join('');
+    // rich_text/title: ALSO read each segment's href — a URL pasted as a
+    // hyperlink ("Doc" → link) has the real URL only in href, not plain_text
+    case 'rich_text': return (prop.rich_text || []).map(t => [t.plain_text || '', t.href || ''].filter(Boolean).join(' ')).join(' ');
+    case 'title':     return (prop.title     || []).map(t => [t.plain_text || '', t.href || ''].filter(Boolean).join(' ')).join(' ');
     case 'select':    return prop.select?.name || '';
     case 'status':    return prop.status?.name || '';
     case 'number':    return String(prop.number ?? '');
@@ -202,6 +204,17 @@ function pageEntryFromNotion(page, config) {
       const id = looseGoogleDocId(getPropText(propVal));
       if (id) { finalDocValue = 'https://docs.google.com/document/d/' + id + '/edit'; break; }
     }
+  }
+
+  // Absolute last resort: scan the page's RAW JSON. Catches a doc URL anywhere
+  // the API returns it — hyperlink hrefs, mentions, nested rollups — regardless
+  // of property type or how getPropText serialises it.
+  if (!finalDocValue || !extractDocFileId(finalDocValue)) {
+    try {
+      const raw = JSON.stringify(props);
+      const m = raw.match(/(?:docs\.google\.com\/document\/d\/|\/file\/d\/|[?&]id=)([a-zA-Z0-9_-]{20,})/);
+      if (m) finalDocValue = 'https://docs.google.com/document/d/' + m[1] + '/edit';
+    } catch {}
   }
 
   if (!finalDocValue) return null;
@@ -525,9 +538,13 @@ async function diagnoseNotFound(docFileId, config) {
         (docLike.length ? `Did you mean: ${docLike.join(', ')}? ` : '') +
         'Fix the Final Doc property name in ⚙ Settings.';
     }
-    return base + ` Property "${propName}" (type: ${_schemaTypes[propName]}) exists but no card contains this doc ID — ` +
+    const t = _schemaTypes[propName];
+    return base + ` Property "${propName}" (type: ${t}) exists but no card contains this doc ID — ` +
       'the Notion card may link a DIFFERENT doc than the email (e.g. a copied doc). ' +
-      'Open the card and compare its doc URL with the email’s.';
+      'Open the card and compare its doc URL with the email’s.' +
+      (t === 'formula'
+        ? ' Note: formulas that depend on relations/rollups can return EMPTY through the API even though Notion displays a value — if so, add the raw doc URL to a plain text/URL property as well.'
+        : '');
   } catch (e) {
     return base + ' Try ↻ Rebuild Cache if this is a new card.';
   }

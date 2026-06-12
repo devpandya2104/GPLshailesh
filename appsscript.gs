@@ -1,5 +1,5 @@
 // ================================================================
-//  GPL — Google Apps Script Web App  v27.0
+//  GPL — Google Apps Script Web App  v27.1
 //  GuestPostLinks Order Tracker
 //  ────────────────────────────────────────
 //  CHANGES v27:
@@ -140,16 +140,12 @@ function appendToSheet(values) {
   }
   var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
   var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
-  values.forEach(function(row) {
-    sheet.appendRow([
-      row[0]||'',  // Publisher Site
-      row[1]||'',  // Doc URL
-      row[2]||'',  // Live URL
-      row[3]||'',  // Invoice URL
-      row[4]||'',  // Order ID
-    ]);
+  // v27.1: one batched write instead of an appendRow API call per row
+  var rows = values.map(function(row) {
+    return [row[0]||'', row[1]||'', row[2]||'', row[3]||'', row[4]||''];
   });
-  return { status: 'ok', appended: values.length };
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 5).setValues(rows);
+  return { status: 'ok', appended: rows.length };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -463,8 +459,10 @@ function stripUtm(u) {
 
 function sameDomain(u1, u2) {
   try {
-    var d1 = u1.match(/^https?:\/\/([^\/]+)/); d1 = d1 ? d1[1].replace(/^www\./).toLowerCase() : '';
-    var d2 = u2.match(/^https?:\/\/([^\/]+)/); d2 = d2 ? d2[1].replace(/^www\./).toLowerCase() : '';
+    // FIX v27.1: .replace(/^www\./) without a replacement arg inserted the
+    // literal string "undefined", breaking www vs non-www domain comparison
+    var d1 = u1.match(/^https?:\/\/([^\/]+)/); d1 = d1 ? d1[1].replace(/^www\./, '').toLowerCase() : '';
+    var d2 = u2.match(/^https?:\/\/([^\/]+)/); d2 = d2 ? d2[1].replace(/^www\./, '').toLowerCase() : '';
     if (!d1 || !d2) return false;
     // Extract root domain (handles co.uk etc.)
     return rootDomainGs(d1) === rootDomainGs(d2);
@@ -504,7 +502,10 @@ function calcSim(a, b) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  FETCH GOOGLE DOC v26
+//  FETCH GOOGLE DOC v27.1 — cached + HTML-export-first
+//  Docs rarely change between Validate clicks, so results are cached for
+//  30 min. HTML export is tried before DocumentApp because it is one fast
+//  HTTP fetch (DocumentApp walks the document tree with many API calls).
 // ════════════════════════════════════════════════════════════════════════════
 function fetchGoogleDoc(docUrl) {
   if (!docUrl) return { status: 'error', message: 'No doc URL', anchors: [], bodyText: '' };
@@ -512,7 +513,53 @@ function fetchGoogleDoc(docUrl) {
   var docId = extractDocId(docUrl);
   if (!docId) return { status: 'error', message: 'Cannot extract Doc ID from: ' + docUrl, anchors: [], bodyText: '' };
 
-  // ── Strategy 1: DocumentApp ───────────────────────────────────────────────
+  try {
+    var hit = CacheService.getScriptCache().get('doc_' + docId);
+    if (hit) return JSON.parse(hit);
+  } catch(eC) {}
+
+  var result = fetchGoogleDocUncached_(docId);
+  if (result.status === 'ok') {
+    try { CacheService.getScriptCache().put('doc_' + docId, JSON.stringify(result), 1800); } catch(eP) {}
+  }
+  return result;
+}
+
+function fetchGoogleDocUncached_(docId) {
+  // ── Strategy 1: HTML export — one fetch gives anchors + text + title.
+  //    First anonymously (public docs), then with the script's OAuth token
+  //    (private docs the script owner can open).
+  var attempts = [
+    { muteHttpExceptions: true, followRedirects: true },
+    { muteHttpExceptions: true, followRedirects: true,
+      headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() } },
+  ];
+  for (var a = 0; a < attempts.length; a++) {
+    try {
+      var htmlResp = UrlFetchApp.fetch(
+        'https://docs.google.com/document/d/' + docId + '/export?format=html',
+        attempts[a]
+      );
+      if (htmlResp.getResponseCode() === 200) {
+        var html = htmlResp.getContentText();
+        var anchors2 = extractAnchorsFromDocHtml(html).filter(function(x) { return !isImageOrMediaUrl(x.url); });
+        var bodyText2 = html.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().substring(0, 8000);
+        var h1Html = '';
+        var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        if (h1M) h1Html = h1M[1].replace(/<[^>]*>/g,'').trim();
+        if (!h1Html) {
+          // Fall back to the document name from <title> (used for bulk-order
+          // title↔slug matching in the side panel)
+          var tM = html.match(/<title>([\s\S]*?)<\/title>/i);
+          if (tM) h1Html = tM[1].replace(/\s*-\s*Google\s*Docs\s*$/i,'').trim();
+        }
+        Logger.log('fetchGoogleDoc (HTML export' + (a ? '+auth' : '') + '): ' + anchors2.length + ' content anchors');
+        return { status: 'ok', method: 'html_export', anchors: anchors2, bodyText: bodyText2, h1: h1Html, docId: docId };
+      }
+    } catch(e2) { Logger.log('HTML export failed: ' + e2.message); }
+  }
+
+  // ── Strategy 2: DocumentApp (slower, but survives odd export permissions) ──
   try {
     var doc  = DocumentApp.openById(docId);
     var body = doc.getBody();
@@ -520,7 +567,7 @@ function fetchGoogleDoc(docUrl) {
     var anchors = [];
     extractDocLinks(body, anchors);
 
-    anchors = anchors.filter(function(a) { return !isImageOrMediaUrl(a.url); });
+    anchors = anchors.filter(function(x) { return !isImageOrMediaUrl(x.url); });
 
     var h1 = '';
     var paragraphs = body.getParagraphs();
@@ -538,25 +585,6 @@ function fetchGoogleDoc(docUrl) {
   } catch(e1) {
     Logger.log('DocumentApp failed: ' + e1.message);
   }
-
-  // ── Strategy 2: Export as HTML ────────────────────────────────────────────
-  try {
-    var htmlResp = UrlFetchApp.fetch(
-      'https://docs.google.com/document/d/' + docId + '/export?format=html',
-      { muteHttpExceptions: true, followRedirects: true }
-    );
-    if (htmlResp.getResponseCode() === 200) {
-      var html = htmlResp.getContentText();
-      var anchors2 = extractAnchorsFromDocHtml(html);
-      anchors2 = anchors2.filter(function(a) { return !isImageOrMediaUrl(a.url); });
-      var bodyText2 = html.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().substring(0, 8000);
-      var h1Html = '';
-      var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-      if (h1M) h1Html = h1M[1].replace(/<[^>]*>/g,'').trim();
-      Logger.log('fetchGoogleDoc (HTML export): ' + anchors2.length + ' content anchors');
-      return { status: 'ok', method: 'html_export', anchors: anchors2, bodyText: bodyText2, h1: h1Html, docId: docId };
-    }
-  } catch(e2) { Logger.log('HTML export failed: ' + e2.message); }
 
   // ── Strategy 3: TXT export ────────────────────────────────────────────────
   try {
@@ -610,24 +638,33 @@ function extractLinksFromElement(el, links) {
 function extractLinksFromText(textEl, links) {
   try {
     var txt = textEl.getText() || '';
-    var pos = 0;
-    while (pos < txt.length) {
+    if (!txt) return;
+    // v27.1: getLinkUrl() is a server round-trip — calling it per character
+    // made long docs take forever. Attribute runs change only at the indices
+    // from getTextAttributeIndices(), so probe just those boundaries and
+    // merge consecutive runs that share the same URL.
+    var idxs = textEl.getTextAttributeIndices();
+    var runs = [];
+    for (var k = 0; k < idxs.length; k++) {
+      var start = idxs[k];
+      var end   = (k + 1 < idxs.length) ? idxs[k + 1] : txt.length;
       var url = null;
-      try { url = textEl.getLinkUrl(pos); } catch(e) { pos++; continue; }
-      if (url) {
-        var start = pos, end = pos + 1;
-        while (end < txt.length) {
-          var u2 = null;
-          try { u2 = textEl.getLinkUrl(end); } catch(e) { break; }
-          if (u2 !== url) break;
-          end++;
-        }
-        var linkText = txt.substring(start, end).trim();
-        if (linkText && url && !links.some(function(l){ return l.url===url && l.text===linkText; })) {
-          links.push({ text: linkText, url: url });
-        }
-        pos = end;
-      } else { pos++; }
+      try { url = textEl.getLinkUrl(start); } catch(e) { continue; }
+      if (!url) continue;
+      var prev = runs[runs.length - 1];
+      if (prev && prev.url === url && prev.end === start) {
+        prev.text += txt.substring(start, end);
+        prev.end = end;
+      } else {
+        runs.push({ url: url, text: txt.substring(start, end), end: end });
+      }
+    }
+    for (var r = 0; r < runs.length; r++) {
+      var linkText = runs[r].text.trim();
+      var u = runs[r].url;
+      if (linkText && !links.some(function(l){ return l.url===u && l.text===linkText; })) {
+        links.push({ text: linkText, url: u });
+      }
     }
   } catch(e) {}
 }
@@ -699,18 +736,19 @@ function writeLiveToClientSheet(clientSheetUrl, docUrl, liveUrl) {
     }
     if (!sheet) sheet = ss.getActiveSheet();
 
-    var data = sheet.getDataRange().getValues();
-    if (!data.length) return { status: 'error', message: 'Sheet is empty' };
+    var lastRow = sheet.getLastRow();
+    var lastCol = sheet.getLastColumn();
+    if (lastRow < 1 || lastCol < 1) return { status: 'error', message: 'Sheet is empty' };
 
-    // ── Find header row & column indices ─────────────────────────────────────
-    // v27 FIX: Scan ALL columns with broad name matching.
+    // ── Extract doc file ID from the search URL ───────────────────────────────
+    var targetDocId = extractDocId(docUrl);
+    if (!targetDocId) return { status: 'error', message: 'Cannot extract doc ID from: ' + docUrl };
+
+    // ── Find header columns (v27.1: read ONLY the header row, not the sheet) ──
     // Client sheets use varied names: "Copied Doc", "Article Doc", "Live Post URL", etc.
-    var headerRow = data[0];
+    var headerRow  = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
     var docColIdx  = -1;
     var liveColIdx = -1;
-
-    // Doc column: any header that contains "doc", "content", "article", "copied"
-    // Live column: any header that contains "live"
     var DOC_HDR_MUST  = ['doc', 'content link', 'article', 'copied'];
     var LIVE_HDR_MUST = ['live'];
 
@@ -728,65 +766,53 @@ function writeLiveToClientSheet(clientSheetUrl, docUrl, liveUrl) {
       }
     }
 
-    // Smarter fallback: scan ALL columns across up to 10 data rows to find
-    // which column actually contains Google Doc URLs. No hard column limit.
-    if (docColIdx === -1) {
-      var scanRows = Math.min(data.length, 11);
-      outer: for (var c = 0; c < headerRow.length; c++) {
-        for (var r = 1; r < scanRows; r++) {
-          var cellVal = String(data[r][c] || '');
-          if (cellVal.indexOf('docs.google.com') !== -1 ||
-              (cellVal.indexOf('google.com/open') !== -1 && cellVal.indexOf('id=') !== -1)) {
-            docColIdx = c;
-            break outer;
+    // ── Locate the row (v27.1: TextFinder instead of loading every cell) ──────
+    // Second pass searches formula text so =HYPERLINK("…id…","Doc") cells match.
+    var matchedRow = -1;
+    var finders = [
+      sheet.createTextFinder(targetDocId),
+      sheet.createTextFinder(targetDocId).matchFormulaText(true),
+    ];
+    for (var f = 0; f < finders.length && matchedRow === -1; f++) {
+      var hits = finders[f].findAll();
+      for (var h = 0; h < hits.length; h++) {
+        var hitRow = hits[h].getRow();
+        if (hitRow <= 1) continue; // skip header
+        if (docColIdx !== -1 && hits[h].getColumn() !== docColIdx + 1) continue;
+        matchedRow = hitRow - 1;                      // 0-based like before
+        if (docColIdx === -1) docColIdx = hits[h].getColumn() - 1;
+        break;
+      }
+      // If we restricted to the doc column and found nothing, retry accepting
+      // a hit in any column (sheet may keep the URL somewhere unexpected)
+      if (matchedRow === -1 && docColIdx !== -1 && f === finders.length - 1) {
+        for (var f2 = 0; f2 < finders.length && matchedRow === -1; f2++) {
+          var hits2 = finders[f2].findAll();
+          for (var h2 = 0; h2 < hits2.length; h2++) {
+            if (hits2[h2].getRow() <= 1) continue;
+            matchedRow = hits2[h2].getRow() - 1;
+            break;
           }
         }
       }
     }
 
-    // Live link fallback: column immediately to the right of docColIdx
-    // (in most client sheets "Live Post URL" is right after the doc column)
-    if (liveColIdx === -1 && docColIdx !== -1) {
-      liveColIdx = docColIdx + 1;
-    }
+    // Live link fallback: column immediately to the right of the doc column
+    if (liveColIdx === -1 && docColIdx !== -1) liveColIdx = docColIdx + 1;
 
-    // Log what we found for debugging
     var docColName  = docColIdx  >= 0 ? String(headerRow[docColIdx]  || 'col '+(docColIdx+1))  : 'NOT FOUND';
     var liveColName = liveColIdx >= 0 ? String(headerRow[liveColIdx] || 'col '+(liveColIdx+1)) : 'NOT FOUND';
-    Logger.log('writeLiveToClientSheet: docCol=' + docColIdx + ' ("' + docColName + '") liveCol=' + liveColIdx + ' ("' + liveColName + '")');
-
-    if (docColIdx === -1) {
-      return {
-        status: 'error',
-        message: 'Cannot find a Doc URL column in this sheet. Headers found: [' +
-          headerRow.slice(0, 30).map(function(h){ return String(h||'').trim(); }).filter(Boolean).join(', ') + ']'
-      };
-    }
-
-    // ── Extract doc file ID from the search URL ───────────────────────────────
-    var targetDocId = extractDocId(docUrl);
-    if (!targetDocId) return { status: 'error', message: 'Cannot extract doc ID from: ' + docUrl };
-
-    // ── Scan ALL doc-column cells; match by file ID OR substring ─────────────
-    var matchedRow = -1;
-    for (var r = 1; r < data.length; r++) {
-      var cellDocUrl = String(data[r][docColIdx] || '').trim();
-      if (!cellDocUrl) continue;
-      // Primary: match by extracted file ID
-      var cellDocId = extractDocId(cellDocUrl);
-      if (cellDocId && cellDocId === targetDocId) { matchedRow = r; break; }
-      // Secondary: substring match (handles URL format differences)
-      if (cellDocUrl.indexOf(targetDocId) !== -1) { matchedRow = r; break; }
-    }
+    Logger.log('writeLiveToClientSheet: docCol=' + docColIdx + ' ("' + docColName + '") liveCol=' + liveColIdx + ' ("' + liveColName + '") row=' + (matchedRow + 1));
 
     if (matchedRow === -1) {
       return {
         status: 'error',
-        message: 'Doc not found in sheet. Checked ' + (data.length - 1) + ' rows in "' + docColName + '" (col ' + (docColIdx + 1) + '). Doc ID searched: ' + targetDocId.slice(0, 20) + '…'
+        message: 'Doc not found in sheet (' + (lastRow - 1) + ' rows searched). Doc ID: ' + targetDocId.slice(0, 20) + '…' +
+          (docColIdx === -1 ? ' No doc column detected either. Headers: [' +
+            headerRow.slice(0, 30).map(function(x){ return String(x||'').trim(); }).filter(Boolean).join(', ') + ']' : '')
       };
     }
 
-    // ── Write the live link ───────────────────────────────────────────────────
     if (liveColIdx === -1) {
       return { status: 'error', message: 'Cannot find Live Link column. Doc row found at row ' + (matchedRow + 1) + '. Please check your sheet headers.' };
     }
